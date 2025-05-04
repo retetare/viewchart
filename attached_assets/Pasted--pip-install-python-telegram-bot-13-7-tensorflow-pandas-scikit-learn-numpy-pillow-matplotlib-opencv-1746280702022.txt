@@ -1,0 +1,361 @@
+!pip install python-telegram-bot==13.7 tensorflow pandas scikit-learn numpy pillow matplotlib opencv-python
+
+import os
+import cv2
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from telegram import Update
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
+from PIL import Image
+from io import BytesIO
+from sklearn.cluster import KMeans
+from datetime import datetime
+
+# Initialize the AI Engine
+class SelfImprovingTradingAI:
+    def __init__(self):
+        # Initialize models
+        self.pattern_model = self._build_pattern_model()
+        self.feature_extractor = self._build_feature_extractor()
+        self.cluster_model = KMeans(n_clusters=10)
+        
+        # Knowledge base
+        self.pattern_db = pd.DataFrame(columns=[
+            'pattern_id', 'features', 'win_rate', 'sample_size', 
+            'last_updated', 'recommendation', 'cluster'
+        ])
+        
+        # User feedback system
+        self.feedback_log = pd.DataFrame(columns=[
+            'user_id', 'pattern_id', 'was_correct', 'timestamp'
+        ])
+        
+        # Learning parameters
+        self.learning_rate = 0.2
+        self.min_samples = 5
+        self.confidence_threshold = 0.7
+        
+        # Initialize with basic patterns
+        self._initialize_basic_patterns()
+
+    def _build_pattern_model(self):
+        """Build CNN model for pattern classification"""
+        model = tf.keras.Sequential([
+            tf.keras.layers.Conv2D(32, (3,3), activation='relu', input_shape=(224, 224, 3)),
+            tf.keras.layers.MaxPooling2D(2,2),
+            tf.keras.layers.Conv2D(64, (3,3), activation='relu'),
+            tf.keras.layers.MaxPooling2D(2,2),
+            tf.keras.layers.Flatten(),
+            tf.keras.layers.Dense(128, activation='relu'),
+            tf.keras.layers.Dense(5, activation='softmax')  # 5 basic pattern types
+        ])
+        model.compile(optimizer='adam',
+                     loss='categorical_crossentropy',
+                     metrics=['accuracy'])
+        return model
+
+    def _build_feature_extractor(self):
+        """Build feature extraction model from intermediate CNN layers"""
+        return tf.keras.Model(
+            inputs=self.pattern_model.inputs,
+            outputs=self.pattern_model.layers[-2].output
+        )
+
+    def _initialize_basic_patterns(self):
+        """Initialize with basic candlestick patterns"""
+        basic_patterns = [
+            {'pattern_id': 'bull_engulf', 'win_rate': 0.65, 'sample_size': 100, 'recommendation': 'buy'},
+            {'pattern_id': 'bear_engulf', 'win_rate': 0.62, 'sample_size': 100, 'recommendation': 'sell'},
+            {'pattern_id': 'hammer', 'win_rate': 0.68, 'sample_size': 100, 'recommendation': 'buy'},
+            {'pattern_id': 'shooting_star', 'win_rate': 0.63, 'sample_size': 100, 'recommendation': 'sell'}
+        ]
+        
+        for pattern in basic_patterns:
+            self.pattern_db = pd.concat([
+                self.pattern_db,
+                pd.DataFrame([{
+                    'pattern_id': pattern['pattern_id'],
+                    'features': None,
+                    'win_rate': pattern['win_rate'],
+                    'sample_size': pattern['sample_size'],
+                    'last_updated': datetime.now(),
+                    'recommendation': pattern['recommendation'],
+                    'cluster': -1
+                }])
+            ], ignore_index=True)
+
+    def analyze_image(self, image_stream):
+        """Full analysis pipeline for an image"""
+        # 1. Preprocess image
+        img = self._preprocess_image(image_stream)
+        
+        # 2. Extract features and classify
+        features = self.feature_extractor.predict(np.array([img]))
+        pred_class = np.argmax(self.pattern_model.predict(np.array([img])))
+        
+        # 3. Find similar historical patterns
+        if len(self.pattern_db) > 10:
+            cluster_id = self.cluster_model.predict(features)[0]
+            similar_patterns = self.pattern_db[
+                self.pattern_db['cluster'] == cluster_id
+            ]
+        else:
+            similar_patterns = pd.DataFrame()
+        
+        # 4. Generate recommendation
+        if len(similar_patterns) > 0:
+            best_pattern = similar_patterns.iloc[
+                similar_patterns['win_rate'].argmax()
+            ]
+            confidence = min(best_pattern['win_rate'], 0.9) * 0.8 + 0.2 * np.max(pred_class)
+            recommendation = {
+                'action': best_pattern['recommendation'],
+                'confidence': confidence,
+                'pattern_id': best_pattern['pattern_id'],
+                'historical_win_rate': best_pattern['win_rate'],
+                'historical_samples': best_pattern['sample_size'],
+                'features': features[0].tolist()  # Store for clustering
+            }
+        else:
+            # Fallback to basic pattern recognition
+            pattern_types = ['bullish', 'bearish', 'consolidation', 'reversal', 'continuation']
+            recommendation = {
+                'action': 'buy' if pred_class in [0,4] else 'sell',
+                'confidence': np.max(pred_class) * 0.7,
+                'pattern_id': f"new_{pattern_types[pred_class]}",
+                'historical_win_rate': 0.5,
+                'historical_samples': 0,
+                'features': features[0].tolist()
+            }
+        
+        return recommendation
+
+    def process_feedback(self, user_id, pattern_id, was_correct):
+        """Incorporate user feedback into knowledge base"""
+        # Log feedback
+        self.feedback_log = pd.concat([
+            self.feedback_log,
+            pd.DataFrame([{
+                'user_id': user_id,
+                'pattern_id': pattern_id,
+                'was_correct': was_correct,
+                'timestamp': datetime.now()
+            }])
+        ], ignore_index=True)
+        
+        # Update pattern database if enough samples
+        pattern_feedback = self.feedback_log[
+            self.feedback_log['pattern_id'] == pattern_id
+        ]
+        
+        if len(pattern_feedback) >= self.min_samples:
+            new_win_rate = pattern_feedback['was_correct'].mean()
+            pattern_idx = self.pattern_db[
+                self.pattern_db['pattern_id'] == pattern_id
+            ].index
+            
+            if len(pattern_idx) > 0:
+                # Update existing pattern
+                old_win_rate = self.pattern_db.loc[pattern_idx[0], 'win_rate']
+                updated_rate = (old_win_rate * (1 - self.learning_rate) + 
+                              new_win_rate * self.learning_rate)
+                
+                self.pattern_db.loc[pattern_idx, [
+                    'win_rate', 'sample_size', 'last_updated'
+                ]] = [
+                    updated_rate,
+                    len(pattern_feedback),
+                    datetime.now()
+                ]
+            else:
+                # Add new pattern if it doesn't exist
+                self.pattern_db = pd.concat([
+                    self.pattern_db,
+                    pd.DataFrame([{
+                        'pattern_id': pattern_id,
+                        'features': None,  # Will be updated with next similar image
+                        'win_rate': new_win_rate,
+                        'sample_size': len(pattern_feedback),
+                        'last_updated': datetime.now(),
+                        'recommendation': 'buy' if 'bull' in pattern_id else 'sell',
+                        'cluster': -1
+                    }])
+                ], ignore_index=True)
+            
+            # Retrain cluster model periodically
+            if len(self.feedback_log) % 50 == 0:
+                self._update_clustering_model()
+
+    def _update_clustering_model(self):
+        """Retrain the pattern clustering model"""
+        if len(self.pattern_db) > 10:
+            valid_patterns = self.pattern_db.dropna(subset=['features'])
+            if len(valid_patterns) > 5:
+                features = np.array(valid_patterns['features'].tolist())
+                self.cluster_model.fit(features)
+                self.pattern_db['cluster'] = self.cluster_model.predict(features)
+
+    def _preprocess_image(self, image_stream):
+        """Convert image to normalized array"""
+        img = Image.open(image_stream)
+        img = img.resize((224, 224))
+        img_array = tf.keras.preprocessing.image.img_to_array(img)
+        return img_array / 255.0
+
+# Initialize the AI engine
+ai_engine = SelfImprovingTradingAI()
+
+# Telegram Bot Setup
+TOKEN = "7920919229:AAFF2BEfB1ObB6-HoCcYgc2eRwdNzF4rYOc"
+
+def start(update: Update, context: CallbackContext):
+    update.message.reply_text(
+        "📈 Welcome to Self-Learning Chart Bot!\n\n"
+        "Send me a chart screenshot and I'll:\n"
+        "1. Analyze the pattern\n"
+        "2. Check historical performance\n"
+        "3. Give a confidence-weighted recommendation\n\n"
+        "After trading, reply with /correct or /incorrect to help me learn!"
+    )
+
+def handle_image(update: Update, context: CallbackContext):
+    try:
+        # Download the image
+        photo_file = update.message.photo[-1].get_file()
+        image_stream = BytesIO()
+        photo_file.download(out=image_stream)
+        image_stream.seek(0)
+        
+        # Analyze the image
+        analysis = ai_engine.analyze_image(image_stream)
+        
+        # Prepare response
+        response = (
+            f"🔍 Pattern Identified: {analysis['pattern_id'].replace('_', ' ').title()}\n"
+            f"📊 Historical Win Rate: {analysis['historical_win_rate']*100:.1f}% "
+            f"(from {analysis['historical_samples']} samples)\n\n"
+            f"💡 Recommendation: {analysis['action'].upper()}\n"
+            f"✅ Confidence: {analysis['confidence']*100:.1f}%\n\n"
+            f"After trading, reply with:\n"
+            f"/correct - If my analysis was accurate\n"
+            f"/incorrect - If it was wrong"
+        )
+        
+        # Send response
+        update.message.reply_text(response)
+        
+        # Store pattern ID for feedback
+        context.user_data['last_analysis'] = analysis
+        
+    except Exception as e:
+        update.message.reply_text(f"❌ Error processing image: {str(e)}")
+
+def correct(update: Update, context: CallbackContext):
+    if 'last_analysis' not in context.user_data:
+        update.message.reply_text("No recent analysis to provide feedback on!")
+        return
+    
+    pattern_id = context.user_data['last_analysis']['pattern_id']
+    user_id = update.message.from_user.id
+    
+    # Process feedback
+    ai_engine.process_feedback(user_id, pattern_id, True)
+    
+    update.message.reply_text(
+        "📝 Thanks for your feedback! I've updated my knowledge base.\n"
+        f"Pattern: {pattern_id.replace('_', ' ').title()}\n"
+        f"Marked as: CORRECT ✅"
+    )
+
+def incorrect(update: Update, context: CallbackContext):
+    if 'last_analysis' not in context.user_data:
+        update.message.reply_text("No recent analysis to provide feedback on!")
+        return
+    
+    pattern_id = context.user_data['last_analysis']['pattern_id']
+    user_id = update.message.from_user.id
+    
+    # Process feedback
+    ai_engine.process_feedback(user_id, pattern_id, False)
+    
+    update.message.reply_text(
+        "📝 Thanks for your feedback! I've updated my knowledge base.\n"
+        f"Pattern: {pattern_id.replace('_', ' ').title()}\n"
+        f"Marked as: INCORRECT ❌"
+    )
+
+def stats(update: Update, context: CallbackContext):
+    """Show learning statistics"""
+    total_patterns = len(ai_engine.pattern_db)
+    total_feedback = len(ai_engine.feedback_log)
+    
+    if total_patterns == 0:
+        update.message.reply_text("No learning data available yet.")
+        return
+    
+    # Calculate overall accuracy
+    if total_feedback > 0:
+        accuracy = ai_engine.feedback_log['was_correct'].mean() * 100
+    else:
+        accuracy = 0
+    
+    # Get top performing patterns
+    top_patterns = ai_engine.pattern_db.sort_values('win_rate', ascending=False).head(3)
+    
+    response = (
+        f"🧠 AI Learning Statistics:\n\n"
+        f"• Total Patterns Learned: {total_patterns}\n"
+        f"• Total Feedback Received: {total_feedback}\n"
+        f"• Current Accuracy: {accuracy:.1f}%\n\n"
+        f"🏆 Top Performing Patterns:\n"
+    )
+    
+    for _, row in top_patterns.iterrows():
+        response += (
+            f"- {row['pattern_id'].replace('_', ' ').title()}: "
+            f"{row['win_rate']*100:.1f}% win rate "
+            f"(from {row['sample_size']} samples)\n"
+        )
+    
+    update.message.reply_text(response)
+
+# Set up the Telegram bot
+def main():
+    updater = Updater(TOKEN, use_context=True)
+    dp = updater.dispatcher
+    
+    # Add handlers
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(MessageHandler(Filters.photo, handle_image))
+    dp.add_handler(CommandHandler("correct", correct))
+    dp.add_handler(CommandHandler("incorrect", incorrect))
+    dp.add_handler(CommandHandler("stats", stats))
+    
+    # Start the bot
+    print("Bot is running... Press Ctrl+C to stop")
+    updater.start_polling()
+    updater.idle()
+
+# Run in Colab
+if __name__ == '__main__':
+    # For Colab, we need to handle the polling differently
+    from telegram.ext import Dispatcher
+    from telegram import Bot
+    
+    # Create bot and dispatcher
+    bot = Bot(token=TOKEN)
+    dispatcher = Dispatcher(bot=bot, update_queue=None)
+    
+    # Add handlers
+    dispatcher.add_handler(CommandHandler("start", start))
+    dispatcher.add_handler(MessageHandler(Filters.photo, handle_image))
+    dispatcher.add_handler(CommandHandler("correct", correct))
+    dispatcher.add_handler(CommandHandler("incorrect", incorrect))
+    dispatcher.add_handler(CommandHandler("stats", stats))
+    
+    # Start polling
+    print("Bot is running in Colab...")
+    updater = Updater(bot=bot, use_context=True)
+    updater.dispatcher = dispatcher
+    updater.start_polling()
